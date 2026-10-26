@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for step-level diffusion execution across runner / worker / executor / engine."""
 
+import asyncio
 import contextlib
 import os
 import queue
@@ -17,7 +18,7 @@ import vllm_omni.diffusion.worker.diffusion_model_runner as model_runner_module
 from tests.helpers.mark import hardware_test
 from vllm_omni.config.config_factory import StageConfigFactory
 from vllm_omni.diffusion.data import DiffusionOutput
-from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.diffusion_kv.metadata import DiffusionKVMetadata
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
@@ -1379,6 +1380,7 @@ class TestRunner:
             cache_backend=None,
             cache_config=None,
             step_execution=True,
+            max_num_seqs=8,
             model_class_name="RequestOnlyPipeline",
             parallel_config=SimpleNamespace(use_hsdp=False),
             streaming_output=False,
@@ -1398,6 +1400,11 @@ class TestRunner:
             lambda _config, pipeline, **_kwargs: (pipeline, None),
         )
         monkeypatch.setattr(model_runner_module, "get_cache_backend", lambda *args, **kwargs: None)
+        monkeypatch.setattr(
+            model_runner_module.current_omni_platform,
+            "init_diffusion_model_runner_runtime",
+            lambda *_args, **_kwargs: None,
+        )
 
         with pytest.raises(ValueError, match="RequestOnlyPipeline"):
             DiffusionModelRunner.load_model(runner)
@@ -1579,6 +1586,98 @@ class TestExecutor:
 @pytest.mark.cpu
 class TestEngine:
     """Step-execution paths in DiffusionEngine.add_req_and_wait_for_response"""
+
+    @staticmethod
+    def _completion_boundary_engine(monkeypatch, mocker):
+        monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+        runner = _make_runner()
+        runner.od_config.completion_boundary_batching = True
+        runner.pipeline = _CompletionBoundaryPipeline()
+        scheduler = StepScheduler()
+        scheduler.initialize(SimpleNamespace(max_num_seqs=2))
+        engine = _make_engine(scheduler, runner.execute_stepwise)
+        engine.execution_mode = DiffusionExecutionMode.STEP_BATCH
+        engine._streaming_playback = None
+        engine._request_cancellations = None
+        engine._out_streams = {}
+        engine._unclaimed_async_outputs = {}
+        engine.main_loop = None
+
+        def collective_rpc(method, args=(), **kwargs):
+            return getattr(runner, method)(*args)
+
+        engine.executor = mocker.Mock()
+        engine.executor.collective_rpc.side_effect = collective_rpc
+        return engine, runner
+
+    def test_completion_boundary_engine_admits_at_boundary_and_delivers_once(self, monkeypatch, mocker):
+        engine, runner = self._completion_boundary_engine(monkeypatch, mocker)
+        for request_id, steps in [("short", 2), ("long", 5)]:
+            engine.scheduler.add_request(_make_engine_request(request_id, steps))
+            engine._out_streams[request_id] = asyncio.Queue()
+
+        def advance():
+            wave = engine.scheduler.schedule()
+            output = engine.execute_fn(wave)
+            finished = engine.scheduler.update_from_output(wave, output)
+            engine._emit_outputs(finished, wave.scheduled_request_ids, output, worker_execution_completed=True)
+
+        advance()
+        assert engine.scheduler._request_progress["long"].current_step == 2
+        assert engine._out_streams["short"].qsize() == 1
+        assert engine._out_streams["long"].empty()
+        survivor = runner.state_cache["long"]
+        engine.scheduler.add_request(_make_engine_request("fresh", 2))
+        engine._out_streams["fresh"] = asyncio.Queue()
+        advance()
+        assert engine.scheduler._request_progress["long"].current_step == 4
+        assert runner.state_cache["long"] is survivor
+        assert engine._out_streams["fresh"].qsize() == 1
+        advance()
+        assert not runner.state_cache and not engine.scheduler.has_requests()
+        assert not engine.scheduler._request_states and not engine.scheduler._request_progress
+        for stream in engine._out_streams.values():
+            assert stream.qsize() == 1
+            result = stream.get_nowait()
+            assert result.finished and result.error is None and not result.aborted
+        assert runner.pipeline.prepare_calls == 3
+
+    @pytest.mark.parametrize("termination", ["cancel", "error"])
+    def test_completion_boundary_engine_cleans_survivor_after_cancel_or_error(self, monkeypatch, mocker, termination):
+        engine, runner = self._completion_boundary_engine(monkeypatch, mocker)
+        for request_id, steps in [("short", 2), ("long", 5)]:
+            engine.scheduler.add_request(_make_engine_request(request_id, steps))
+            engine._out_streams[request_id] = asyncio.Queue()
+        wave = engine.scheduler.schedule()
+        output = engine.execute_fn(wave)
+        finished = engine.scheduler.update_from_output(wave, output)
+        engine._emit_outputs(finished, wave.scheduled_request_ids, output, worker_execution_completed=True)
+        assert runner.state_cache["long"].step_index == 2
+        if termination == "cancel":
+            engine.abort("long")
+            engine._process_aborts_queue()
+            engine._emit_finished_outputs(engine.scheduler.pending_finished_request_ids())
+        else:
+
+            def fail(*args, **kwargs):
+                raise RuntimeError("denoise failure")
+
+            monkeypatch.setattr(runner.pipeline, "denoise_step", fail)
+            wave = engine.scheduler.schedule()
+            with pytest.raises(RuntimeError, match="denoise failure"):
+                engine.execute_fn(wave)
+            output = BatchRunnerOutput.from_list(
+                [RunnerOutput(request_id="long", finished=True, result=DiffusionOutput(error="denoise failure"))]
+            )
+            finished = engine.scheduler.update_from_output(wave, output)
+            engine._emit_outputs(finished, wave.scheduled_request_ids, output)
+        assert not runner.state_cache and not engine.scheduler.has_requests()
+        assert not engine.scheduler._request_states and not engine.scheduler._request_progress
+        assert engine._out_streams["short"].qsize() == 1
+        assert engine._out_streams["long"].qsize() == 1
+        result = engine._out_streams["long"].get_nowait()
+        assert result.finished
+        assert result.aborted if termination == "cancel" else result.error == "denoise failure"
 
     @pytest.mark.parametrize(
         ("execute_fn", "expected_error"),
